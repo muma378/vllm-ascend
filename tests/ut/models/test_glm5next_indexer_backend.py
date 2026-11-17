@@ -45,6 +45,7 @@ def test_wrapper_selects_model_backend_and_preserves_weight_names() -> None:
     wrapper = IndexerWrapper(_FakeIndexer(), qk_rope_head_dim=0)
 
     assert isinstance(wrapper.impl, _FakeKPoolBackend)
+    assert not wrapper.supports_staged_cache_update
     names = set(dict(wrapper.named_parameters()))
     assert {
         "wq_b.weight",

@@ -584,3 +584,30 @@ def test_c4_cache_spec_accounts_for_packed_key_and_mx_scales():
     )
     assert spec.real_page_size_bytes == 128 * (64 + 4)
     assert spec.page_size_bytes == spec.real_page_size_bytes
+
+
+@pytest.mark.parametrize("compute_topk", [False, True])
+def test_staged_indexer_does_not_recompute_or_regather(compute_topk):
+    events = []
+    k, weights, q = torch.zeros(2, 1, 4), torch.ones(2, 2), object()
+    metadata = SimpleNamespace(cos=None, sin=None, slot_mapping=torch.arange(2))
+    indexer = SimpleNamespace(
+        forward_k=Mock(side_effect=AssertionError("K projection repeated")),
+        _gather_cache_inputs=Mock(side_effect=AssertionError("collective repeated")),
+        prepare_query=Mock(side_effect=AssertionError("Q projection repeated")),
+        write_cache=lambda *args: events.append("cache"),
+        select_topk=lambda *args: events.append("topk") or q,
+    )
+    result = AscendSFAIndexerBackend.forward(
+        indexer,
+        weights,
+        weights,
+        weights,
+        metadata,
+        compute_topk=compute_topk,
+        prepared_k=(k, None, weights),
+        gathered_cache=(k, None),
+        prepared_query=(q,),
+    )
+    assert result is (q if compute_topk else None)
+    assert events == (["cache", "topk"] if compute_topk else ["cache"])

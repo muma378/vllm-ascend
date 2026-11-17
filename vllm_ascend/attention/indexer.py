@@ -52,6 +52,7 @@ from vllm_ascend.utils import (
 # tuple (the scale slot exists only when LI C8 is enabled).
 INDEXER_K_CACHE_SLOT = 0
 INDEXER_SCALE_CACHE_SLOT = 1
+IndexerPreparedQuery = tuple[torch.Tensor, torch.Tensor | None, torch.Size | None, torch.Tensor]
 
 
 @dataclass
@@ -406,6 +407,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         indexer_metadata: AscendSFAIndexerMetadata,
         compute_topk: bool = True,
         attn_q_gather_handle: torch.distributed.Work | None = None,
+        prepared_k: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor] | None = None,
+        gathered_cache: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        prepared_query: IndexerPreparedQuery | None = None,
     ) -> torch.Tensor | None:
         """Full indexer pipeline: k path -> cache write -> top-k selection.
 
@@ -419,21 +423,40 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         inputs."""
         cos = indexer_metadata.cos
         sin = indexer_metadata.sin
-        k_li, k_li_scale, indexer_weights = self.forward_k(k_hidden_states, cos, sin)
+        k_li, k_li_scale, indexer_weights = (
+            self.forward_k(k_hidden_states, cos, sin) if prepared_k is None else prepared_k
+        )
         if attn_q_gather_handle is not None:
             # Keep the k projection overlapped with Q communication, but order
             # the TP cache gathers after Q to avoid concurrent cross-group AIV
             # collectives during graph replay. wait() adds a stream dependency.
             attn_q_gather_handle.wait()
-        k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
+        if gathered_cache is None:
+            k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
+        else:
+            k_li, k_li_scale = gathered_cache
+            slot_mapping = indexer_metadata.slot_mapping
         self.write_cache(k_li, k_li_scale, slot_mapping)
         if not compute_topk:
             return None
 
+        query = prepared_query
+        if query is None:
+            query = self.prepare_query(hidden_states, q_c, k_hidden_states, indexer_metadata, indexer_weights)
+        return self.select_topk(query, indexer_metadata)
+
+    def prepare_query(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k_hidden_states: torch.Tensor,
+        indexer_metadata: AscendSFAIndexerMetadata,
+        indexer_weights: torch.Tensor,
+    ) -> IndexerPreparedQuery:
+        """Prepare local Q and weights without reading the indexer cache."""
+        cos, sin = indexer_metadata.cos, indexer_metadata.sin
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
-        assert indexer_metadata.actual_seq_lengths_query is not None
-        assert indexer_metadata.actual_seq_lengths_key is not None
 
         if hidden_states is k_hidden_states:
             # The k path already ran wk_weights_proj on these hidden states
@@ -491,6 +514,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             q_li_shape_ori = q_li.shape
             q_li, q_li_scale = self._quantize_li_tensor(q_li)
 
+        return q_li, q_li_scale, q_li_shape_ori, weights
+
+    def select_topk(self, query: IndexerPreparedQuery, indexer_metadata: AscendSFAIndexerMetadata) -> torch.Tensor:
+        """Consume prepared Q only after the current K cache has been written."""
+        q_li, q_li_scale, q_li_shape_ori, weights = query
+        assert indexer_metadata.actual_seq_lengths_query is not None
+        assert indexer_metadata.actual_seq_lengths_key is not None
         topk_selector = getattr(indexer_metadata, "topk_selector", None)
         if topk_selector is not None:
             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
