@@ -575,6 +575,10 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
+    # Experimental GLM native DSA-CP communication policy; legacy is the rollback.
+    dsa_cp_comm_mode: Literal["legacy", "async", "fused"] = "legacy"
+    # Disable only for the fusion-without-overlap benchmark ablation.
+    dsa_cp_comm_overlap: bool = True
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True

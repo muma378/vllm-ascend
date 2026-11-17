@@ -195,6 +195,21 @@ class TestAscendConfig(TestBase):
         self.assertFalse(config.scheduler_config.short_request_first_config.enabled)
         self.assertFalse(config.rl_config.enabled)
 
+    def test_dsa_cp_communication_config(self):
+        defaults = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+        self.assertEqual(defaults.dsa_cp_comm_mode, "legacy")
+        self.assertTrue(defaults.dsa_cp_comm_overlap)
+        for mode in ("legacy", "async", "fused"):
+            config = AscendConfig(
+                sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                dsa_cp_comm_mode=mode,
+                dsa_cp_comm_overlap=False,
+            )
+            self.assertEqual(config.dsa_cp_comm_mode, mode)
+            self.assertFalse(config.dsa_cp_comm_overlap)
+        with self.assertRaises(ValueError):
+            AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), dsa_cp_comm_mode="invalid")
+
     def test_eplb_load_collection_phase_defaults_to_all(self):
         self.assertEqual(EplbConfig().load_collection_phase, "all")
 

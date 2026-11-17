@@ -331,6 +331,38 @@ class TestIndexerWrapper(TestBase):
         wrapper.process_weights_after_loading()
         wrapper.impl.process_weights_after_loading.assert_called_once_with()
 
+    @patch("vllm_ascend.ops.mla.AscendSFAIndexerBackend")
+    def test_staged_indexer_interface_reaches_backend(self, mock_backend_cls):
+        wrapper = IndexerWrapper(MagicMock(), qk_rope_head_dim=64)
+        k, scale, weights, query = (object() for _ in range(4))
+        wrapper.impl.forward_k.return_value = (k, scale, weights)
+        wrapper.impl.prepare_query.return_value = query
+        self.assertTrue(wrapper.supports_staged_cache_update)
+        self.assertEqual(wrapper.forward_k("hidden", "cos", "sin"), (k, scale, weights))
+        wrapper.impl.forward_k.assert_called_once_with("hidden", "cos", "sin")
+        self.assertIs(wrapper.prepare_query("hidden", "q_c", "hidden", "meta", weights), query)
+        wrapper.impl.prepare_query.assert_called_once_with("hidden", "q_c", "hidden", "meta", weights)
+        wrapper(
+            "hidden",
+            "q_c",
+            "hidden",
+            "meta",
+            prepared_k=(k, scale, weights),
+            gathered_cache=(k, scale),
+            prepared_query=query,
+        )
+        wrapper.impl.assert_called_once_with(
+            "hidden",
+            "q_c",
+            "hidden",
+            "meta",
+            True,
+            attn_q_gather_handle=None,
+            prepared_k=(k, scale, weights),
+            gathered_cache=(k, scale),
+            prepared_query=query,
+        )
+
 
 class TestAscendMultiHeadLatentAttention(TestBase):
     def setUp(self):

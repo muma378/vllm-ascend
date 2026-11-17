@@ -1689,6 +1689,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         return
 
+    def _start_indexer_kv_comm(self, k_pe, k_nope, knope_scale, k_hidden_states, indexer_metadata):
+        """Optional native DSA-CP orchestration hook; other layouts stay unchanged."""
+        return None
+
     def _get_indexer_attn_q_gather_handle(self, attn_metadata: M) -> torch.distributed.Work | None:
         return None
 
@@ -1953,6 +1957,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if gate_hidden_states is not None:
                 gate_hidden_states = hidden_states
 
+        indexer_comm = None
+        indexer_query = None
         if fused_type != PreprocessType.NATIVE:
             # Keep the raw hidden states for the indexer's k path: the fused
             # preprocess below returns new tensors and does not modify this
@@ -2017,15 +2023,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             k_pe, k_nope = kv_outputs[:2]
             knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-            # k_li no longer exists at this point: it is computed by
-            # indexer.forward_k below and gathered at cache-write time, so
-            # the fused gather below only carries the main KV.
-            fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
-                k_pe,
-                k_nope,
-                knope_scale,
-                parallel_context.gather_full_o_proj,
-            )
+            # Native DSA-CP may prepare indexer K now and share the main KV
+            # collective. Other layouts retain the indexer's own gather.
+            if self.runtime_has_indexer and indexer_attn_metadata is not None:
+                indexer_comm = self._start_indexer_kv_comm(
+                    k_pe, k_nope, knope_scale, k_hidden_states, indexer_attn_metadata
+                )
+            if indexer_comm is None:
+                fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
+                    k_pe, k_nope, knope_scale, parallel_context.gather_full_o_proj
+                )
+
+            if indexer_comm is not None and not indexer_comm.overlap:
+                fused_kv_no_split = indexer_comm.finish()
+                kv_ag_handles = []
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             if self.qk_rope_head_dim:
@@ -2035,6 +2046,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 q_pe,
                 attn_metadata,
             )
+
+            if indexer_comm is not None:
+                if not self.skip_topk and attn_metadata.num_actual_tokens > 0:
+                    indexer_query = self.indexer.prepare_query(
+                        hidden_states, q_c, k_hidden_states, indexer_attn_metadata, indexer_comm.prepared_k[2]
+                    )
+                # All independent Q work has been submitted. Wait only before
+                # cache consumers, preserving collective order within TP.
+                if indexer_comm.overlap:
+                    fused_kv_no_split = indexer_comm.finish()
+                    kv_ag_handles = []
 
             (
                 k_pe,
@@ -2065,6 +2087,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert k_hidden_states is not None
             assert indexer_attn_metadata is not None
             self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
+            staged_inputs = {}
+            if indexer_comm is not None:
+                staged_inputs = dict(
+                    prepared_k=indexer_comm.prepared_k,
+                    gathered_cache=indexer_comm.indexer_cache,
+                    prepared_query=indexer_query,
+                )
             topk_indices = self.indexer(
                 hidden_states,
                 q_c,
@@ -2072,6 +2101,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 indexer_attn_metadata,
                 compute_topk=not self.skip_topk and has_local_query,
                 attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
+                **staged_inputs,
             )
             if self.skip_topk:
                 topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)

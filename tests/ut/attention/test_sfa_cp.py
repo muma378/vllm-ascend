@@ -901,8 +901,9 @@ def test_sfa_cp_query_gather_axis_follows_composed_layout() -> None:
     "has_indexer,is_mtp,skip_topk,expect_indexer",
     [(True, False, True, False), (True, True, True, True), (True, False, False, True), (False, False, True, False)],
 )
+@pytest.mark.parametrize("comm_overlap", [None, False, True])
 def test_dsa_cp_indexer_cache_follows_runtime_ownership(
-    sfa_c8, li_c8, preprocess_type, has_indexer, is_mtp, skip_topk, expect_indexer
+    sfa_c8, li_c8, preprocess_type, has_indexer, is_mtp, skip_topk, expect_indexer, comm_overlap
 ):
     # Exercise the actual SFA forward, including cache composition and metadata
     # lookup. Only projections/kernels are mocked; static layers have no cache
@@ -974,6 +975,21 @@ def test_dsa_cp_indexer_cache_follows_runtime_ownership(
     impl._execute_sparse_flash_attention_process = MagicMock(return_value=hidden_states)
     impl._v_up_proj = MagicMock(return_value=hidden_states)
     impl._finalize_o_proj = MagicMock(return_value=hidden_states)
+    staged_comm = None
+    events = []
+    if comm_overlap is not None and expect_indexer and preprocess_type == PreprocessType.NATIVE:
+        staged_comm = SimpleNamespace(
+            overlap=comm_overlap,
+            prepared_k=(hidden_states, None, hidden_states),
+            indexer_cache=(hidden_states, None),
+            finish=Mock(side_effect=lambda: events.append("finish") or hidden_states),
+        )
+        impl._start_indexer_kv_comm = Mock(return_value=staged_comm)
+        indexer.prepare_query.side_effect = lambda *args: events.append("query") or (hidden_states,)
+        impl._store_parallel_kv.side_effect = lambda *args: (
+            events.append("main_cache") or (hidden_states, hidden_states)
+        )
+        indexer.side_effect = lambda *args, **kwargs: events.append("indexer_cache_topk") or computed_topk
     with (
         patch("vllm_ascend.attention.sfa_v1.get_forward_context", return_value=forward_context),
         patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector"),
@@ -985,6 +1001,14 @@ def test_dsa_cp_indexer_cache_follows_runtime_ownership(
     if expect_indexer:
         indexer.assert_called_once()
         assert indexer.call_args.kwargs["compute_topk"] is (not skip_topk)
+        if staged_comm is not None:
+            assert indexer.call_args.kwargs["prepared_k"] is staged_comm.prepared_k
+            assert indexer.call_args.kwargs["gathered_cache"] is staged_comm.indexer_cache
+            assert events.index("finish") < events.index("main_cache") < events.index("indexer_cache_topk")
+            if not skip_topk:
+                assert (events.index("query") < events.index("finish")) is comm_overlap
+            else:
+                indexer.prepare_query.assert_not_called()
         # Trimming attention inputs may create a view of the original tensor.
         k_hidden_states = indexer.call_args.args[2]
         torch.testing.assert_close(k_hidden_states, hidden_states)
@@ -1670,3 +1694,40 @@ def test_dsa_dcp_indexer_attn_q_gather_handle(has_prefill, has_handle):
 def test_other_sfa_layouts_have_no_indexer_attn_q_gather_handle(impl_cls):
     impl = impl_cls.__new__(impl_cls)
     assert impl._get_indexer_attn_q_gather_handle(Mock()) is None
+
+
+@pytest.mark.parametrize("mode", ["legacy", "async", "fused"])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("full_o_proj", [False, True])
+@pytest.mark.parametrize("dcp,pcp", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_main_kv_overlap_does_not_require_an_indexer(mode, overlap, full_o_proj, dcp, pcp, packed):
+    impl = SimpleNamespace(
+        has_indexer=False,
+        qk_rope_head_dim=2,
+        uses_packed_sfa_main_cache=packed,
+        dsa_cp_comm_mode=mode,
+        dsa_cp_comm_overlap=overlap,
+    )
+    k_pe, k_nope = torch.ones(2, 2), torch.zeros(2, 4)
+    work = Mock()
+    with (
+        patch(
+            "vllm_ascend.attention.context_parallel.sfa_cp.get_dcp_group", return_value=SimpleNamespace(world_size=dcp)
+        ),
+        patch(
+            "vllm_ascend.attention.context_parallel.sfa_cp.get_pcp_group", return_value=SimpleNamespace(world_size=pcp)
+        ),
+        patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", return_value=object()),
+        patch(
+            "vllm_ascend.attention.context_parallel.sfa_cp.all_gather_async",
+            return_value=(torch.zeros(4, 7 if packed else 6), work),
+        ) as gather,
+    ):
+        _, handles = AscendSFADSACPImpl._prepare_kv_for_parallel(
+            impl, k_pe, k_nope, torch.ones(2, 1) if packed else None, full_o_proj
+        )
+    expected = full_o_proj or (mode != "legacy" and overlap and not packed and dcp == pcp == 1)
+    assert gather.call_args.kwargs["async_op"] is expected
+    assert handles == [work]
+    work.wait.assert_not_called()

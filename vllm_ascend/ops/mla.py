@@ -20,6 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -31,7 +33,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
-from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, IndexerPreparedQuery
 from vllm_ascend.attention.mla_v1 import AscendMLAAttention
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 
@@ -97,6 +99,16 @@ class IndexerWrapper(nn.Module):
     def process_weights_after_loading(self) -> None:
         self.impl.process_weights_after_loading()
 
+    @property
+    def supports_staged_cache_update(self) -> bool:
+        return all(callable(getattr(self.impl, name, None)) for name in ("forward_k", "prepare_query"))
+
+    def forward_k(self, hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        return self.impl.forward_k(hidden_states, cos, sin)
+
+    def prepare_query(self, hidden_states, q_c, k_hidden_states, indexer_metadata, indexer_weights):
+        return self.impl.prepare_query(hidden_states, q_c, k_hidden_states, indexer_metadata, indexer_weights)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -105,7 +117,17 @@ class IndexerWrapper(nn.Module):
         indexer_metadata: AttentionMetadata,
         compute_topk: bool = True,
         attn_q_gather_handle: torch.distributed.Work | None = None,
+        prepared_k: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor] | None = None,
+        gathered_cache: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        prepared_query: IndexerPreparedQuery | None = None,
     ) -> torch.Tensor | None:
+        staged_inputs: dict[str, Any] = {}
+        if prepared_k is not None:
+            staged_inputs["prepared_k"] = prepared_k
+        if gathered_cache is not None:
+            staged_inputs["gathered_cache"] = gathered_cache
+        if prepared_query is not None:
+            staged_inputs["prepared_query"] = prepared_query
         return self.impl(
             hidden_states,
             q_c,
@@ -113,6 +135,7 @@ class IndexerWrapper(nn.Module):
             indexer_metadata,
             compute_topk,
             attn_q_gather_handle=attn_q_gather_handle,
+            **staged_inputs,
         )
 
 

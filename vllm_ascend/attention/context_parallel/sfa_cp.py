@@ -16,6 +16,7 @@ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: igno
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 import vllm_ascend.ops.triton.dcp.dcp_a2a  # noqa: F401
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import (
     DCPImplMixin,
@@ -31,6 +32,7 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     get_sfa_dcp_max_local_block_table_cols,
     get_sfa_pcp_global_metadata,
 )
+from vllm_ascend.attention.dsa_cp_comm import DSACPCommBuffers, IndexerKVComm
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
@@ -620,10 +622,17 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
 
     o_proj_full_pools: dict[Any, torch.Tensor] = {}
     o_proj_weight_switch_pool_key = "sfa_o_proj"
+    dsa_cp_comm_mode = "legacy"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.local_num_heads = self.num_heads * self.tp_size
+        self.dsa_cp_comm_mode = get_ascend_config().dsa_cp_comm_mode
+        self.dsa_cp_comm_overlap = get_ascend_config().dsa_cp_comm_overlap
+        self._dsa_cp_comm_buffers = DSACPCommBuffers()
+        logger.info_once(
+            "Native DSA-CP communication mode=%s, overlap=%s", self.dsa_cp_comm_mode, self.dsa_cp_comm_overlap
+        )
         self.enable_dsa_cp_full_o_proj = enable_dsa_cp_full_o_proj()
         self._initialize_o_proj_weight_switch(WeightSwitchConfig.from_group(get_tp_group()))
 
@@ -716,6 +725,32 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         )
         return k_pe, k_nope, None
 
+    def _start_indexer_kv_comm(self, k_pe, k_nope, knope_scale, k_hidden_states, indexer_metadata):
+        mode = self.dsa_cp_comm_mode
+        # DCP has its own Q collective ordering; do not introduce overlapping
+        # cross-group AIV collectives in that path. Native GLM uses separate
+        # floating main caches. Packed cache formats keep their existing path.
+        if (
+            mode not in ("async", "fused")
+            or get_dcp_group().world_size > 1
+            or get_pcp_group().world_size > 1
+            or self.uses_packed_sfa_main_cache
+            or k_nope is None
+            or not getattr(self.indexer, "supports_staged_cache_update", True)
+        ):
+            return None
+        prepared_k = self.indexer.forward_k(k_hidden_states, indexer_metadata.cos, indexer_metadata.sin)
+        main_parts = (k_nope,) if k_pe is None else (k_pe, k_nope)
+        return IndexerKVComm.start(
+            main_parts,
+            prepared_k,
+            get_tp_group(),
+            mode,
+            self._dsa_cp_comm_buffers,
+            all_gather_async,
+            overlap=self.dsa_cp_comm_overlap,
+        )
+
     def _prepare_kv_for_parallel(
         self,
         k_pe,
@@ -724,7 +759,15 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         full_gather_o_proj_enabled,
     ):
         assert k_nope is not None
-        async_op = full_gather_o_proj_enabled
+        # Shared-top-k layers have no runtime indexer to join the staged
+        # collective. They still overlap main KV with Q in the new modes.
+        async_op = full_gather_o_proj_enabled or (
+            self.dsa_cp_comm_mode in ("async", "fused")
+            and self.dsa_cp_comm_overlap
+            and not self.uses_packed_sfa_main_cache
+            and get_dcp_group().world_size == 1
+            and get_pcp_group().world_size == 1
+        )
         handles: list[torch.distributed.Work] = []
         if self.qk_rope_head_dim == 0 and not self.uses_packed_sfa_main_cache:
             parts = [k_nope]
