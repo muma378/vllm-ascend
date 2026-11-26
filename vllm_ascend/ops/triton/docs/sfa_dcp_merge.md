@@ -4,7 +4,7 @@
 
 - **Function**: Combines received partial attention outputs using their FP32 LSE weights. It does not perform communication.
 - **Formula**: For finite LSE values, `w_r = exp(lse_r - max_valid_lse) / sum_valid(exp(lse - max_valid_lse))` and `out = sum_valid(w_r * partial_r)`. Nonfinite-LSE ranks contribute zero; an all-invalid position returns zero.
-- **Algorithm flow**: Load the rank-wise LSE vector; derive finite weights using a finite substitute for an all-invalid maximum; accumulate one FP32 output vector rank by rank. Mask invalid output values before weighting so `NaN * 0` cannot contaminate the result.
+- **Algorithm flow**: Load the rank-wise LSE vector and derive weights with a finite substitute for an all-invalid maximum. Mask invalid values before weighting so `NaN * 0` cannot contaminate the result. Accumulate the result in FP32, then convert to the destination dtype at store time.
 - **Supported modes**: NPU eager execution and ACLGraph capture/replay. The implementation uses shared Triton capability helpers rather than hardware-generation branches; Atlas A3 has execution evidence.
 
 ## Parameters
@@ -14,7 +14,8 @@
 | `out_recv` | Input | `[R, T, H, D]` or `[R, H, T, D]` | BF16, FP16 or FP32 | ND, unit innermost stride |
 | `lse_recv` | Input | Corresponding `[R, T, H]` or `[R, H, T]` | FP32 | ND, unit innermost stride |
 | `token_dim` | Attribute | 1 for token-major, 2 for head-major received payload | integer | scalar |
-| result | Output | `[T, H, D]` | FP32 | ND, contiguous |
+| `output_dtype` | Attribute | Destination dtype, defaults to FP32. The registered exchange requests BF16. | dtype | scalar |
+| result | Output | `[T, H, D]` | BF16 or FP32 | ND, contiguous |
 
 ## Constraints
 
@@ -22,6 +23,7 @@
 - Feature tails are masked. A single program keeps at most512 FP32 feature elements plus the rank vector, rather than materializing an `R x D` working tile.
 - Finite-LSE filtering, finite `safe_max`, zero-denominator handling and invalid-output masking are part of numerical semantics, not optional defensive checks.
 - Runtime head counts, work counts and strides are not exact-value constexpr keys. The LSE rank stride is a `do_not_specialize` runtime scalar, so changing token count does not create an exact-stride variant. See [DCP JIT warmup](dcp_a2a_fused.md#jit-warmup) for owner registration and remaining hardware validation.
+- The destination pointer dtype is part of Triton specialization. Startup warmup records the BF16 destination used by the registered exchange.
 - This is an internal NPU kernel API, not a Torch CPU fallback implementation. The public DCP operator retains upstream routing for modes not using this payload.
 
 ## Origin and Differences
@@ -31,7 +33,7 @@
 
 ## Test Cases
 
-The single-card matrix covers R2/4/8, both layouts, D127/496/512/513, BF16/FP16/FP32, all-invalid positions and changed-input graph replay against FP64. Distributed exchange tests additionally cover the actual packed payload and collective ordering.
+The single-card matrix covers R2/4/8, both layouts, D127/496/512/513, BF16/FP16/FP32 inputs, all-invalid positions and changed-input graph replay against FP64. The identity-transport test checks the BF16 store bit for bit against FP32 merge followed by a cast for singleton, full-vector and tiled pack shapes. Distributed exchange tests cover the packed payload and collective ordering.
 
 ```bash
 pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py -k merge

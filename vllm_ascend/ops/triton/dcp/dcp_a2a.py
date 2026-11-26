@@ -551,7 +551,13 @@ def dcp_a2a_fused_combine(
     if _use_fast_exchange(partial_output, softmax_lse, scatter_size, scatter_dim, pcp_group, return_lse, defer_combine):
         if scatter_group is None:
             raise ValueError("SFA output scatter requires an explicit All2All group.")
-        return exchange(partial_output, softmax_lse, scatter_group, softmax_sum=softmax_sum).to(partial_output.dtype)
+        return exchange(
+            partial_output,
+            softmax_lse,
+            scatter_group,
+            softmax_sum=softmax_sum,
+            output_dtype=partial_output.dtype,
+        )
 
     send = pack_dcp_output_lse(
         partial_output,

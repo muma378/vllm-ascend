@@ -183,7 +183,9 @@ def can_exchange(output: torch.Tensor, lse: torch.Tensor, ranks: int) -> bool:
     )
 
 
-def _exchange_tokens(output: torch.Tensor, lse: torch.Tensor, group, ranks: int, softmax_sum=None) -> torch.Tensor:
+def _exchange_tokens(
+    output: torch.Tensor, lse: torch.Tensor, group, ranks: int, softmax_sum, output_dtype: torch.dtype
+) -> torch.Tensor:
     tokens = output.shape[0]
     head_dim = output.shape[-1]
     local_heads = output.shape[1] // ranks
@@ -212,18 +214,25 @@ def _exchange_tokens(output: torch.Tensor, lse: torch.Tensor, group, ranks: int,
         (peer_words, local_heads, 1),
         storage_offset=tokens * output_words,
     )
-    return fused_merge(parts, stats, token_dim=1)
+    return fused_merge(parts, stats, token_dim=1, output_dtype=output_dtype)
 
 
-def exchange(output: torch.Tensor, lse: torch.Tensor, group, softmax_sum=None) -> torch.Tensor:
-    """Exchange head shards, retaining FP32 LSE bits and merge math."""
+def exchange(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    softmax_sum=None,
+    *,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Exchange head shards and retain FP32 LSE and accumulation."""
     if softmax_sum is not None and (
         softmax_sum.shape != lse.shape or softmax_sum.dtype != torch.float32 or softmax_sum.device != lse.device
     ):
         raise ValueError("softmax_sum must match the FP32 softmax_max shape and device")
     ranks = dist.get_world_size(group)
     if output.shape[0] != 1:
-        return _exchange_tokens(output, lse, group, ranks, softmax_sum)
+        return _exchange_tokens(output, lse, group, ranks, softmax_sum, output_dtype)
     head_dim = output.shape[-1]
     local_heads = output.shape[1] // ranks
     head_words = head_dim // 2  # Two BF16 values per INT32 word.
@@ -251,7 +260,7 @@ def exchange(output: torch.Tensor, lse: torch.Tensor, group, softmax_sum=None) -
         (peer_words, 1, 1),
         storage_offset=output_words,
     )
-    return fused_merge(parts, stats, token_dim=2)
+    return fused_merge(parts, stats, token_dim=2, output_dtype=output_dtype)
 
 
 def _vector_cores():

@@ -308,6 +308,7 @@ def test_merge_rank_stride_is_runtime_and_offset_alignment_is_covered():
     )
     owner = next(owner for owner in registry._registrations if owner.kernel is dcp_warmup._fused_merge_kernel)
     inputs = [dict(key.inputs) for key in _dcp_warmup_keys(registry)[owner]]
+    assert {case["result_ptr"].dtype for case in inputs} == {torch.bfloat16}
     assert {case["lse_ptr"].aligned for case in inputs} == {False, True}
     assert {case["lse_stride_rank"] for case in inputs} == {2}
     assert {case["NATIVE_LAYOUT"] for case in inputs} == {False, True}

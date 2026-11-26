@@ -8,6 +8,18 @@ import torch
 from vllm_ascend.ops.triton.dcp import dcp_a2a
 
 
+def test_native_exchange_stores_bf16_without_an_outer_cast(monkeypatch):
+    partial = torch.empty(96, 64, 512, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(96, 64, 1, dtype=torch.float32, device="meta")
+    group = object()
+    result = object()
+    exchange = Mock(return_value=result)
+    monkeypatch.setattr(dcp_a2a, "exchange", exchange)
+
+    assert dcp_a2a.dcp_a2a_fused_combine(partial, lse, 8, 1, group) is result
+    exchange.assert_called_once_with(partial, lse, group, softmax_sum=None, output_dtype=torch.bfloat16)
+
+
 @pytest.mark.parametrize("scatter_dim", [0, 1])
 @pytest.mark.parametrize("dtype,packed_extra", [(torch.float32, 1), (torch.bfloat16, 4)])
 def test_deferred_fake_layout(scatter_dim, dtype, packed_extra):
