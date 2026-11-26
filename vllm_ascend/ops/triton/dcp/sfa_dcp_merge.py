@@ -74,16 +74,20 @@ def _fused_merge_kernel(
             # through a zero LSE weight (NaN * 0 is still NaN).
             values = tl.where(get_element(finite, (rank,)), values, 0.0)
             result += values * weight
+        if result_ptr.dtype.element_ty == tl.bfloat16:
+            result = result.to(tl.bfloat16, fp_downcast_rounding="rtne")
         tl.store(result_ptr + (token * head_count + head) * head_dim + dim, result, mask=mask)
 
 
-def fused_merge(out_recv: torch.Tensor, lse_recv: torch.Tensor, token_dim: int) -> torch.Tensor:
-    """Merge the validated rank/token/head payload produced by exchange."""
+def fused_merge(
+    out_recv: torch.Tensor, lse_recv: torch.Tensor, token_dim: int, *, output_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Merge in FP32 and store in the caller's requested dtype."""
     if token_dim == 2:
         _, heads, tokens, head_dim = out_recv.shape
     else:
         _, tokens, heads, head_dim = out_recv.shape
-    result = torch.empty((tokens, heads, head_dim), dtype=torch.float32, device=out_recv.device)
+    result = torch.empty((tokens, heads, head_dim), dtype=output_dtype, device=out_recv.device)
     init_device_properties_triton()
     _launch_fused_merge(out_recv, lse_recv, result, token_dim, get_vectorcore_num(), _launch_kernel)
     return result

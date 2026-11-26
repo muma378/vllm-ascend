@@ -149,7 +149,7 @@ def _record_exchange(output, lse, softmax_sum, ranks, vector_cores, launch):
             strides=(peer_words, local_heads, 1),
         )
         token_dim = 1
-    result = _Tensor(torch.float32, shape=(tokens, local_heads, head_dim))
+    result = _Tensor(output.dtype, shape=(tokens, local_heads, head_dim))
     _launch_fused_merge(parts, stats, result, token_dim, vector_cores, launch)
 
 

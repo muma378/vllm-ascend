@@ -1,0 +1,4 @@
+pr: 2
+entries:
+  - category: performance
+    text: Native BF16 SFA decode with head-scatter DCP now writes the merged result directly in BF16, removing a Cast launch and an intermediate FP32 tensor.

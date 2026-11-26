@@ -238,7 +238,7 @@ def test_output_pack_and_combine_changed_graph_inputs(tokens, world, heads, with
     graph.reset()
 
 
-@pytest.mark.parametrize("tokens,local_heads", [(1, 2), (17, 2), (191, 32), (512, 32), (257, 64)])
+@pytest.mark.parametrize("tokens,local_heads", [(1, 2), (17, 2), (96, 8), (384, 8), (191, 32), (512, 32), (257, 64)])
 @pytest.mark.parametrize("from_stats", [False, True])
 def test_exchange_statistics_with_identity_transport(monkeypatch, tokens, local_heads, from_stats):
     from vllm_ascend.ops.triton.dcp import sfa_dcp_exchange as exchange
@@ -252,13 +252,15 @@ def test_exchange_statistics_with_identity_transport(monkeypatch, tokens, local_
     group = object()
 
     def run():
-        return exchange.exchange(output, maxima, group, softmax_sum=sums)
+        fp32 = exchange.exchange(output, maxima, group, softmax_sum=sums)
+        direct = exchange.exchange(output, maxima, group, softmax_sum=sums, output_dtype=output.dtype)
+        return fp32, direct
 
     for _ in range(3):
         run()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        actual = run()
+        actual, direct = run()
     for invalid in (False, True):
         if sums is not None:
             sums.mul_(0.75)
@@ -275,6 +277,8 @@ def test_exchange_statistics_with_identity_transport(monkeypatch, tokens, local_
         parts = output.cpu().double().reshape(tokens, 2, local_heads, 512).permute(1, 0, 2, 3)
         expected = (parts.masked_fill(~valid[..., None], 0) * weights[..., None]).sum(0)
         assert_dcp_close(actual, expected)
+        assert direct.dtype == torch.bfloat16
+        assert torch.equal(direct.cpu().view(torch.int16), actual.to(torch.bfloat16).cpu().view(torch.int16))
     graph.reset()
 
 
@@ -345,7 +349,7 @@ def test_dcp_registry_warmup_prevents_runtime_compile_and_replays(monkeypatch, m
                 local_lse = local_lse.transpose(0, 1).contiguous().transpose(0, 1)
 
             def forward(partial=partial, lse=lse, sums=sums, local=local, local_lse=local_lse):
-                exchanged = sfa_dcp_exchange.exchange(partial, lse, group, softmax_sum=sums)
+                exchanged = dcp_a2a.dcp_a2a_fused_combine(partial, lse, 2, 1, group, softmax_sum=sums)
                 if not mla:
                     return exchanged, None
                 packed = pack_dcp_output_lse(partial, lse, 2, 1)
